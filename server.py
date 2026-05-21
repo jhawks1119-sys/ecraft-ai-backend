@@ -13,7 +13,7 @@ from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 import anthropic
 
-# API key always comes from environment on Railway -- never from a file
+# API key always comes from environment on Railway — never from a file
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 if not ANTHROPIC_API_KEY:
@@ -30,7 +30,9 @@ BRAND_CONTEXT = {
     "plumbing":    "Brizo, Waterworks, Hansgrohe, Newport Brass, Lefroy Brooks, Dornbracht, Kohler Artifacts, Rohl",
     "cabinets":    "Kith Cabinetry, Wolf Home Products, Plain English, deVOL Kitchens, Omega Cabinetry, Showplace",
     "wallpaper":   "Ronald Redding Designs, Katie Kime, Cole & Son, Serena & Lily, Borastapeter, De Gournay, Schumacher, Phillip Jeffries",
-    "paint":       "Farrow & Ball, Benjamin Moore, Sherwin-Williams, Clare Paint, Little Greene",
+    "paint":              "Farrow & Ball, Benjamin Moore, Sherwin-Williams, Clare Paint, Little Greene",
+    "exterior_paint":     "Sherwin-Williams Exteriors (Superpaint, Emerald), Benjamin Moore Aura Exterior, Farrow & Ball Exterior Eggshell, Cabot Stains",
+    "interior_paint":     "Farrow & Ball, Benjamin Moore, Sherwin-Williams, Clare Paint, Little Greene, Portola Paints",
     "hardware":    "Emtek, Rejuvenation, Rocky Mountain Hardware, Grandeur, Baldwin, Nostalgic Warehouse, Ashley Norton",
     "mirrors":     "Visual Comfort, Restoration Hardware, Uttermost, Currey & Company, Arteriors, Made Goods",
     "countertops": "MSI Surfaces, Arizona Tile, Walker Zanger, Cambria, Caesarstone, Silestone, Calacatta Gold Marble, Quartzmaster",
@@ -42,9 +44,13 @@ BRAND_CONTEXT = {
 
 
 def detect_image_media_type(content_type_header="", url="", raw_bytes=b""):
+    """Detect actual image MIME type from header, URL extension, or magic bytes."""
+    # 1. Try Content-Type header first
     ct = content_type_header.split(";")[0].strip().lower()
     if ct in ("image/jpeg", "image/png", "image/webp", "image/gif"):
         return ct
+
+    # 2. Try URL extension
     url_lower = url.lower().split("?")[0]
     if url_lower.endswith(".png"):
         return "image/png"
@@ -54,6 +60,8 @@ def detect_image_media_type(content_type_header="", url="", raw_bytes=b""):
         return "image/webp"
     if url_lower.endswith(".gif"):
         return "image/gif"
+
+    # 3. Sniff magic bytes
     if raw_bytes[:8] == b"\x89PNG\r\n\x1a\n":
         return "image/png"
     if raw_bytes[:3] == b"\xff\xd8\xff":
@@ -62,6 +70,8 @@ def detect_image_media_type(content_type_header="", url="", raw_bytes=b""):
         return "image/webp"
     if raw_bytes[:6] in (b"GIF87a", b"GIF89a"):
         return "image/gif"
+
+    # 4. Default
     return "image/jpeg"
 
 
@@ -75,6 +85,63 @@ def strip_fences(text):
         if part.startswith("[") or part.startswith("{"):
             return part
     return text
+
+
+def build_populate_prompt(tier_name, style_notes, project_name, rooms_hint, categories_map):
+    """Prompt for /api/populate-from-plans — populates a finish schedule
+    from a look book + floor plans, following the Finish Schedule Population Guide."""
+    lines = [
+        "You are E-Craft's expert finish schedule populator. E-Craft is a luxury custom home builder.",
+        "",
+        "Project context:",
+        f"- Project name: {project_name or '(unnamed)'}",
+        f"- Design tier: {tier_name}",
+        f"- Style notes: {style_notes or '(none provided)'}",
+        f"- Known rooms in this project: {', '.join(rooms_hint) if rooms_hint else '(parse from the files)'}",
+        "",
+        "You will receive a project LOOK BOOK (designer's curated product images and palette) and FLOOR PLANS (architectural sheets).",
+        "Read EVERYTHING carefully before responding. Cross-reference the look book against the plans.",
+        "",
+        "Your job: populate a Finish Schedule covering these categories. Each is annotated with typical brands for this tier:",
+    ]
+    for cat, brands in categories_map.items():
+        lines.append(f"  - {cat}: {brands}")
+    lines += [
+        "",
+        "FOR EACH SELECTION you can identify (filled in OR explicitly TBD), output one item. Use these fields:",
+        '  "category" - one of the keys above (use the EXACT key, e.g. \"interior_paint\" not \"Interior Paint\")',
+        '  "location" - specific location label (e.g. \"Primary Bath Floor\", \"Kitchen Island\", \"Front Door\", \"Living Room Walls\")',
+        '  "room"     - room name if applicable (Kitchen, Primary Bath, etc.)',
+        '  "name"     - product name / color name / model name',
+        '  "mfr"      - manufacturer / brand',
+        '  "color"    - color name (paint, cabinets, tile)',
+        '  "number"   - color # / SKU (e.g. \"SW 7005\", \"OC-17\")',
+        '  "lrv"      - paint LRV number if listed (paint categories only, otherwise omit)',
+        '  "finish"   - finish/sheen (e.g. \"Eggshell\", \"Satin Brass\", \"Honed\")',
+        '  "sku"      - SKU/model # for non-paint products',
+        '  "size"     - size/dimension if relevant',
+        '  "qty"      - quantity if implied by plans (e.g. door count, fixture count)',
+        '  "status"   - \"selected\" (clearly chosen and confirmed) or \"tbd\" (placeholder, pending, missing, or conflict)',
+        '  "notes"    - layout direction, grout color, install notes, look-book page, OR a conflict flag',
+        "",
+        "FLAGGING RULES:",
+        "  - Set status='tbd' when the item is labeled TBD, Pending, To Select, ?, blank, or shown as an empty placeholder in the look book.",
+        "  - When a category is implied by the plans (e.g. plans show a tiled shower, or paint schedule callout) but no selection appears in the look book, still output the row with status='tbd' so the team knows it's missing.",
+        "  - When a look-book selection CONTRADICTS the plans, set status='tbd' and start `notes` with 'CONFLICT: ' followed by a short description of the contradiction.",
+        "",
+        "OUTPUT — return ONE JSON object only. No markdown fences, no explanation. Structure:",
+        '{',
+        '  "summary": "1-3 sentence plain-English overview of what you found (be honest about gaps)",',
+        '  "tabs": {',
+        '     "<category>": {"status": "populated"|"partial"|"empty", "items_added": <int>, "items_tbd": <int>}',
+        '  },',
+        '  "items": [ ... rows as described above ... ]',
+        '}',
+        "",
+        "Only include categories you have at least one item for (selected OR tbd) in `tabs`. Omit empty categories.",
+        "If you genuinely cannot identify anything, return: " + '{"summary":"No selections detected.","tabs":{},"items":[]}',
+    ]
+    return "\n".join(lines)
 
 
 def build_lookbook_prompt(tier_name, style_notes, cats, extra=""):
@@ -157,7 +224,7 @@ def suggest():
     proj_ctx_block = ""
     if proj_ctx:
         proj_ctx_block = (
-            "\nIMPORTANT - Design cohesion: Your suggestions MUST visually and stylistically "
+            "\nIMPORTANT – Design cohesion: Your suggestions MUST visually and stylistically "
             "complement the selections already confirmed for this project. Match the dominant finish "
             "family, aesthetic (e.g. warm transitional, modern farmhouse, organic modern), and quality "
             "tier already established. Do not suggest items that clash in finish or style.\n"
@@ -223,7 +290,7 @@ def price_source():
     room        = data.get("room", "")
     finish      = data.get("finish", "")
     tier        = int(data.get("tier", 2))
-    mode        = data.get("mode", "exact")
+    mode        = data.get("mode", "exact")   # "exact" | "similar"
     style_notes = data.get("style_notes", "")
 
     if not product:
@@ -236,12 +303,12 @@ def price_source():
             "Find the EXACT product listed (same brand, model, finish) at the lowest price available. "
             "Search across: manufacturer direct, authorized dealers, trade sources (Build.com, Ferguson, "
             "Houzz, Capitol Lighting, etc.), big-box (Home Depot Pro, Lowes Pro), and Amazon. "
-            "Rank results cheapest first. Include the best 3-4 sources."
+            "Rank results cheapest first. Include the best 3–4 sources."
         )
-        result_name_note = "Use the exact product name -- do NOT substitute alternatives."
+        result_name_note = "Use the exact product name — do NOT substitute alternatives."
     else:
         mode_instruction = (
-            "Find 3-4 ALTERNATIVE products that are similar in style, quality, and function but at a "
+            "Find 3–4 ALTERNATIVE products that are similar in style, quality, and function but at a "
             "lower price point. Match the aesthetic (finish family, style, material) closely. "
             "Each alternative should be a real, currently available product from a reputable brand. "
             "Rank by best value (quality per dollar)."
@@ -266,18 +333,24 @@ def price_source():
         f"Search mode: {'EXACT MATCH' if mode=='exact' else 'BEST VALUE ALTERNATIVES'}",
         mode_instruction,
         "",
-        "For each result, provide realistic lead time estimates.",
+        "For each result, provide realistic lead time estimates:",
+        "- In stock / 1-3 days = items typically available at retail",
+        "- 1-2 weeks = special order from stocking dealers",
+        "- 3-6 weeks = manufacturer lead time for stocked items",
+        "- 8-16 weeks = custom / made to order / imported",
+        "- 16-26+ weeks = luxury/custom with long lead times",
         "",
         "Return ONLY a valid JSON array. Each item must have exactly these keys:",
         '  "name"       - product name (brand + model + finish)',
         '  "vendor"     - specific vendor/retailer name',
-        '  "price"      - price or price range as string',
+        '  "price"      - price or price range as string (e.g. "$1,249" or "$800–$950")',
         '  "lead_time"  - realistic shipping/lead time estimate',
         '  "detail"     - one short phrase about this source/option',
         '  "shop_url"   - direct URL to product page if known, else ""',
-        '  "google_url" - Google Shopping URL',
+        '  "google_url" - Google Shopping URL: "https://www.google.com/search?q=' +
+                          '{encoded query}&tbm=shop" with the product name encoded',
         result_name_note,
-        "No markdown, no explanation -- only the JSON array.",
+        "No markdown, no explanation — only the JSON array.",
     ]
     prompt = "\n".join(prompt_lines)
 
@@ -292,6 +365,7 @@ def price_source():
         results = json.loads(text)
         if not isinstance(results, list):
             raise ValueError("Expected a list")
+        # Build Google Shopping URLs for any result missing one
         import urllib.parse
         for r in results:
             if not r.get("google_url") and r.get("name"):
@@ -472,6 +546,87 @@ def analyze_lookbook_url():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/populate-from-plans", methods=["POST"])
+def populate_from_plans():
+    """Populate a finish schedule from a look book + floor plans.
+    Accepts: lookbook_files[], plan_files[], style_notes, tier, project_name, rooms[]
+    Returns: {summary, tabs, items}
+    """
+    if not ANTHROPIC_API_KEY:
+        return jsonify({"error": "No API key configured"}), 503
+
+    data            = request.get_json(force=True)
+    lookbook_files  = data.get("lookbook_files", [])
+    plan_files      = data.get("plan_files", [])
+    style_notes     = data.get("style_notes", "")
+    project_name    = data.get("project_name", "")
+    rooms_hint      = data.get("rooms", [])
+    tier            = int(data.get("tier", 2))
+
+    if not lookbook_files and not plan_files:
+        return jsonify({"error": "No files provided"}), 400
+
+    content = []
+    if lookbook_files:
+        content.append({"type": "text", "text": "=== LOOK BOOK (designer's curated selections) ==="})
+        for f in lookbook_files[:6]:
+            mt  = f.get("mediaType", "image/jpeg")
+            b64 = f.get("data", "")
+            if not b64:
+                continue
+            if mt == "application/pdf":
+                content.append({"type": "document",
+                                "source": {"type": "base64", "media_type": "application/pdf", "data": b64}})
+            else:
+                content.append({"type": "image",
+                                "source": {"type": "base64", "media_type": mt, "data": b64}})
+    if plan_files:
+        content.append({"type": "text", "text": "=== FLOOR PLANS (architectural sheets) ==="})
+        for f in plan_files[:6]:
+            mt  = f.get("mediaType", "application/pdf")
+            b64 = f.get("data", "")
+            if not b64:
+                continue
+            if mt == "application/pdf":
+                content.append({"type": "document",
+                                "source": {"type": "base64", "media_type": "application/pdf", "data": b64}})
+            else:
+                content.append({"type": "image",
+                                "source": {"type": "base64", "media_type": mt, "data": b64}})
+
+    if not any(c.get("type") in ("image", "document") for c in content):
+        return jsonify({"error": "No valid file content"}), 400
+
+    tier_name = TIER_NAMES.get(tier, "Signature E-Craft")
+    schedule_cats = ["tile", "lighting", "plumbing", "cabinets", "wallpaper",
+                     "exterior_paint", "interior_paint", "hardware", "mirrors",
+                     "countertops", "doors", "windows", "trim", "appliances"]
+    cats_map = {k: BRAND_CONTEXT[k] for k in schedule_cats if k in BRAND_CONTEXT}
+    prompt = build_populate_prompt(tier_name, style_notes, project_name, rooms_hint, cats_map)
+    content.append({"type": "text", "text": prompt})
+
+    try:
+        client   = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=4096,
+            messages=[{"role": "user", "content": content}],
+        )
+        text   = strip_fences(response.content[0].text.strip())
+        result = json.loads(text)
+        if not isinstance(result, dict) or "items" not in result:
+            raise ValueError("Expected an object with summary/tabs/items keys")
+        result.setdefault("summary", "")
+        result.setdefault("tabs", {})
+        return jsonify(result)
+    except json.JSONDecodeError as e:
+        print(f"Populate JSON error: {e}")
+        return jsonify({"error": "Could not parse AI response"}), 500
+    except Exception as e:
+        print(f"Populate error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 if __name__ == "__main__":
     print()
     print("+=================================================+")
@@ -483,6 +638,7 @@ if __name__ == "__main__":
     if ANTHROPIC_API_KEY:
         print("  API key loaded - AI suggestions active")
     else:
-        print("  No API key - set ANTHROPIC_API_KEY environment variable")
+        print("  No API key - open config.py and paste your key")
     print()
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
